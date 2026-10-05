@@ -1,0 +1,22 @@
+[
+    {
+        "question": "What is the candidate's name?",
+        "ground_truth": "Rahul Ray",
+        "relevant_pages": [1]
+    },
+    {
+        "question": "What was the first DSA question?",
+        "ground_truth": "Find the longest substring without repeating characters.",
+        "relevant_pages": [2]
+    },
+    {
+        "question": "What was the date of the interview?",
+        "ground_truth": "29/09/2026",
+        "relevant_pages": [2]
+    },
+    {
+        "question": "What type of interview was Round 1?",
+        "ground_truth": "DSA + project",
+        "relevant_pages": [2]
+    }
+]
