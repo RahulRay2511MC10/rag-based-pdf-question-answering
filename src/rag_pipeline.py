@@ -2,9 +2,8 @@ import os
 
 from src.embeddings import get_embedding_model
 from src.vector_store import VectorStore
-from src.retriever import Retriever
-from src.reranker import Reranker
 from src.query_rewriter import QueryRewriter
+from src.reranker import Reranker
 from src.generator import Generator
 
 
@@ -13,193 +12,482 @@ class RAGPipeline:
     def __init__(
         self,
         chunks,
-        vector_store_path="vector_store/index.faiss"
+        vector_store_path=None
     ):
 
-        # =========================================================
-        # 1. VALIDATE CHUNKS
-        # =========================================================
+        """
+        Initialize the RAG pipeline.
 
-        if not isinstance(chunks, list):
-            raise TypeError(
-                "chunks must be a list"
-            )
+        Parameters
+        ----------
+        chunks : list
+            Chunked documents with text and metadata.
+
+        vector_store_path : str or None
+            If a path is provided and the FAISS index exists,
+            load that index.
+
+            Otherwise create a fresh FAISS index.
+        """
+
+        # ======================================================
+        # STORE CHUNKS
+        # ======================================================
 
         self.chunks = chunks
 
-        # =========================================================
-        # 2. EMBEDDING MODEL
-        # =========================================================
+        if not self.chunks:
 
-        self.embedding_model = get_embedding_model()
+            raise ValueError(
+                "No chunks were provided."
+            )
 
-        # =========================================================
-        # 3. VECTOR STORE
-        # =========================================================
+        # ======================================================
+        # 1. EMBEDDING MODEL
+        # ======================================================
 
-        if os.path.exists(vector_store_path):
+        self.embedding_model = (
+            get_embedding_model()
+        )
+
+        # ======================================================
+        # 2. QUERY REWRITER
+        # ======================================================
+
+        self.query_rewriter = (
+            QueryRewriter()
+        )
+
+        # ======================================================
+        # 3. CROSS-ENCODER RERANKER
+        # ======================================================
+
+        self.reranker = (
+            Reranker()
+        )
+
+        # ======================================================
+        # 4. LLM GENERATOR
+        # ======================================================
+
+        self.generator = (
+            Generator()
+        )
+
+        # ======================================================
+        # 5. VECTOR STORE
+        # ======================================================
+
+        if (
+            vector_store_path
+            and os.path.exists(
+                vector_store_path
+            )
+        ):
 
             print(
                 "Loading existing vector store..."
             )
 
-            self.vector_store = VectorStore.load(
-                vector_store_path
+            self.vector_store = (
+                VectorStore.load(
+                    vector_store_path
+                )
             )
 
         else:
 
             print(
-                "Creating vector store..."
+                "Creating new vector store..."
             )
 
-            # IMPORTANT:
-            # Embed chunk TEXT, not the complete chunk dictionary.
+            # --------------------------------------------------
+            # Extract text from chunks
+            # --------------------------------------------------
+
             texts = [
                 chunk["text"]
                 for chunk in self.chunks
             ]
 
+            # --------------------------------------------------
+            # Generate document embeddings
+            # --------------------------------------------------
+
             embeddings = (
-                self.embedding_model.embed_documents(
+                self.embedding_model
+                .embed_documents(
                     texts
                 )
             )
+
+            if not embeddings:
+
+                raise ValueError(
+                    "No embeddings were generated."
+                )
+
+            # --------------------------------------------------
+            # Determine embedding dimension
+            # --------------------------------------------------
 
             dimension = len(
                 embeddings[0]
             )
 
-            self.vector_store = VectorStore(
-                dimension
+            # --------------------------------------------------
+            # Create FAISS index
+            # --------------------------------------------------
+
+            self.vector_store = (
+                VectorStore(
+                    dimension
+                )
             )
+
+            # --------------------------------------------------
+            # Add embeddings to FAISS
+            # --------------------------------------------------
 
             self.vector_store.add(
                 embeddings
             )
 
-            directory = os.path.dirname(
-                vector_store_path
-            )
+            # --------------------------------------------------
+            # Save index if path provided
+            # --------------------------------------------------
 
-            if directory:
+            if vector_store_path:
 
-                os.makedirs(
-                    directory,
-                    exist_ok=True
+                directory = os.path.dirname(
+                    vector_store_path
                 )
 
-            self.vector_store.save(
-                vector_store_path
-            )
+                if directory:
 
-            print(
-                "Vector store saved."
-            )
+                    os.makedirs(
+                        directory,
+                        exist_ok=True
+                    )
 
-        # =========================================================
-        # 4. RETRIEVER
-        # =========================================================
+                self.vector_store.save(
+                    vector_store_path
+                )
 
-        self.retriever = Retriever(
-            self.embedding_model,
-            self.vector_store,
-            self.chunks
-        )
-
-        # =========================================================
-        # 5. QUERY REWRITER
-        # =========================================================
-
-        self.query_rewriter = QueryRewriter()
-
-        # =========================================================
-        # 6. CROSS-ENCODER RERANKER
-        # =========================================================
-
-        self.reranker = Reranker()
-
-        # =========================================================
-        # 7. GENERATOR
-        # =========================================================
-
-        self.generator = Generator()
+                print(
+                    "Vector store saved."
+                )
 
 
-    # =============================================================
-    # BASIC FAISS RETRIEVAL
-    # =============================================================
-
-    def retrieve(
-        self,
-        question,
-        k=5,
-        page=None,
-        source=None
-    ):
-
-        return self.retriever.retrieve(
-            question,
-            k=k,
-            page=page,
-            source=source
-        )
-
-
-    # =============================================================
-    # FAISS + CROSS-ENCODER RERANKING
-    # =============================================================
+    # ==========================================================
+    # RETRIEVAL + RERANKING
+    # ==========================================================
 
     def retrieve_reranked(
         self,
         question,
         retrieval_k=10,
         final_k=5,
-        page=None,
-        source=None
+        source_filter=None
     ):
 
-        # ---------------------------------------------------------
-        # STEP 1: FAISS RETRIEVAL
-        # ---------------------------------------------------------
+        """
+        Retrieve top-k candidates from FAISS,
+        optionally filter them by source,
+        and rerank them using the Cross-Encoder.
 
-        results = self.retriever.retrieve(
-            question,
-            k=retrieval_k,
-            page=page,
-            source=source
-        )
+        Parameters
+        ----------
+        question : str
+            Rewritten user query.
 
-        if not results:
-            return []
+        retrieval_k : int
+            Number of candidates requested from FAISS.
 
-        # ---------------------------------------------------------
-        # STEP 2: CROSS-ENCODER RERANKING
-        # ---------------------------------------------------------
+        final_k : int
+            Number of results returned after reranking.
 
-        results = self.reranker.rerank(
-            query=question,
-            results=results,
-            top_k=final_k
-        )
+        source_filter : str or None
+            If None:
+                Search all uploaded documents.
 
-        # ---------------------------------------------------------
-        # STEP 3: DEBUG RERANKED RESULTS
-        # ---------------------------------------------------------
+            If a filename is provided:
+                Search only chunks belonging to that PDF.
+        """
 
         print("\n" + "=" * 60)
-        print("RERANKED RESULTS")
+        print("RAG RETRIEVAL")
         print("=" * 60)
+
+        print(
+            "Query:",
+            question
+        )
+
+        print(
+            "Retrieval K:",
+            retrieval_k
+        )
+
+        print(
+            "Final K:",
+            final_k
+        )
+
+        print(
+            "Source filter:",
+            source_filter
+        )
+
+        # ======================================================
+        # 1. EMBED QUERY
+        # ======================================================
+
+        query_embedding = (
+            self.embedding_model
+            .embed_query(
+                question
+            )
+        )
+
+        # ======================================================
+        # 2. FAISS SEARCH
+        # ======================================================
+
+        # ------------------------------------------------------
+        # IMPORTANT
+        #
+        # If we have a source filter, simply searching only
+        # `retrieval_k` vectors can be problematic.
+        #
+        # Example:
+        #
+        # FAISS top 10:
+        #
+        # 1. Resume.pdf
+        # 2. Resume.pdf
+        # 3. Interview.pdf
+        # ...
+        # 10. Resume.pdf
+        #
+        # Rahul.pdf may be relevant but not appear in top 10.
+        #
+        # Therefore, when filtering by source, retrieve more
+        # candidates first and then apply the source filter.
+        # ======================================================
+
+        total_chunks = len(
+            self.chunks
+        )
+
+        if source_filter is not None:
+
+            search_k = min(
+                max(
+                    retrieval_k * 5,
+                    50
+                ),
+                total_chunks
+            )
+
+        else:
+
+            search_k = min(
+                retrieval_k,
+                total_chunks
+            )
+
+        print(
+            "FAISS search K:",
+            search_k
+        )
+
+        distances, indices = (
+            self.vector_store.search(
+                query_embedding,
+                search_k
+            )
+        )
+
+        # ======================================================
+        # 3. CONVERT FAISS RESULTS
+        # ======================================================
+
+        results = []
+
+        for distance, index in zip(
+            distances,
+            indices
+        ):
+
+            index = int(index)
+
+            # --------------------------------------------------
+            # Invalid FAISS index
+            # --------------------------------------------------
+
+            if index < 0:
+                continue
+
+            # --------------------------------------------------
+            # Out-of-range index
+            # --------------------------------------------------
+
+            if index >= len(
+                self.chunks
+            ):
+                continue
+
+            # --------------------------------------------------
+            # Get chunk
+            # --------------------------------------------------
+
+            chunk = self.chunks[
+                index
+            ]
+
+            # --------------------------------------------------
+            # Get metadata
+            # --------------------------------------------------
+
+            metadata = chunk.get(
+                "metadata",
+                {}
+            )
+
+            source = metadata.get(
+                "source",
+                "Unknown"
+            )
+
+            # ==================================================
+            # SOURCE FILTER
+            # ==================================================
+
+            if source_filter is not None:
+
+                if source != source_filter:
+
+                    continue
+
+            # ==================================================
+            # ADD RESULT
+            # ==================================================
+
+            results.append(
+                {
+                    "chunk": chunk,
+
+                    "distance": float(
+                        distance
+                    )
+                }
+            )
+
+            # --------------------------------------------------
+            # We can stop once we have enough candidates.
+            # --------------------------------------------------
+
+            if len(results) >= retrieval_k:
+
+                break
+
+        # ======================================================
+        # DEBUG
+        # ======================================================
+
+        print("\nFILTERED RETRIEVAL RESULTS")
+        print("-" * 60)
+
+        print(
+            "Number of candidates:",
+            len(results)
+        )
 
         for rank, result in enumerate(
             results,
             start=1
         ):
 
-            chunk = result.get(
-                "chunk",
+            chunk = result[
+                "chunk"
+            ]
+
+            metadata = chunk.get(
+                "metadata",
                 {}
             )
+
+            print(
+                f"\nCandidate {rank}"
+            )
+
+            print(
+                "Distance:",
+                result.get(
+                    "distance"
+                )
+            )
+
+            print(
+                "Source:",
+                metadata.get(
+                    "source"
+                )
+            )
+
+            print(
+                "Page:",
+                metadata.get(
+                    "page"
+                )
+            )
+
+            print(
+                "Text:",
+                chunk.get(
+                    "text",
+                    ""
+                )[:300]
+            )
+
+        # ======================================================
+        # NO RESULTS
+        # ======================================================
+
+        if not results:
+
+            print(
+                "No matching chunks found."
+            )
+
+            return []
+
+        # ======================================================
+        # 4. CROSS-ENCODER RERANKING
+        # ======================================================
+
+        results = self.reranker.rerank(
+            question,
+            results,
+            top_k=final_k
+        )
+
+        # ======================================================
+        # FINAL RESULTS
+        # ======================================================
+
+        print("\nRERANKED RESULTS")
+        print("-" * 60)
+
+        for rank, result in enumerate(
+            results,
+            start=1
+        ):
+
+            chunk = result[
+                "chunk"
+            ]
 
             metadata = chunk.get(
                 "metadata",
@@ -211,80 +499,118 @@ class RAGPipeline:
             )
 
             print(
-                "FAISS Distance:",
-                result.get("distance")
-            )
-
-            print(
-                "Rerank Score:",
-                result.get("rerank_score")
+                "Source:",
+                metadata.get(
+                    "source"
+                )
             )
 
             print(
                 "Page:",
-                metadata.get("page")
+                metadata.get(
+                    "page"
+                )
             )
 
             print(
-                "Source:",
-                metadata.get("source")
-            )
-
-            print("Text:")
-
-            print(
-                chunk.get(
-                    "text",
-                    ""
-                )[:500]
+                "Rerank score:",
+                result.get(
+                    "rerank_score"
+                )
             )
 
         return results
 
 
-    # =============================================================
-    # PAGE-LEVEL CITATION SELECTION
-    # =============================================================
+    # ==========================================================
+    # BUILD LLM CONTEXT
+    # ==========================================================
+
+    def build_context(
+        self,
+        results
+    ):
+
+        """
+        Build the context that will be sent to the LLM.
+        """
+
+        context_parts = []
+
+        for i, result in enumerate(
+            results,
+            start=1
+        ):
+
+            chunk = result[
+                "chunk"
+            ]
+
+            text = chunk.get(
+                "text",
+                ""
+            )
+
+            metadata = chunk.get(
+                "metadata",
+                {}
+            )
+
+            source = metadata.get(
+                "source",
+                "Unknown"
+            )
+
+            page = metadata.get(
+                "page",
+                "Unknown"
+            )
+
+            context_parts.append(
+                f"""
+[Context {i}]
+
+Source: {source}
+
+Page: {page}
+
+{text}
+"""
+            )
+
+        return "\n".join(
+            context_parts
+        )
+
+
+    # ==========================================================
+    # SELECT CITATIONS
+    # ==========================================================
 
     def select_citations(
         self,
         results,
         max_citations=3
     ):
+
         """
-        Select citation pages from reranked results.
+        Select unique citations.
 
-        Strategy:
+        For multi-PDF retrieval, the uniqueness key is:
 
-        1. Group retrieved chunks by page.
-        2. If multiple chunks belong to the same page,
-           keep the highest reranker score.
-        3. Rank pages using their best reranker score.
-        4. Return only the strongest unique pages.
+            (source, page)
 
-        This prevents output such as:
+        rather than just:
 
-            Page 2
-            Page 2
-            Page 2
-            Page 1
-            Page 4
+            page
 
-        and instead produces:
-
-            Page 2
-            Page 1
-            Page 4
+        because Page 1 of Rahul.pdf and Page 1 of
+        Interview.pdf are different sources.
         """
 
-        if not results:
-            return []
+        citations = []
 
-        # ---------------------------------------------------------
-        # Group results by page
-        # ---------------------------------------------------------
-
-        page_candidates = {}
+        seen = set()
 
         for result in results:
 
@@ -298,141 +624,128 @@ class RAGPipeline:
                 {}
             )
 
-            page_number = metadata.get(
-                "page"
+            source = metadata.get(
+                "source",
+                "Unknown"
             )
 
-            source_name = metadata.get(
-                "source"
+            page = metadata.get(
+                "page",
+                "Unknown"
             )
 
-            rerank_score = result.get(
-                "rerank_score"
+            key = (
+                source,
+                page
             )
 
-            # Ignore results without page information
-            if page_number is None:
+            if key in seen:
+
                 continue
 
-            # If reranker score is unavailable,
-            # use a very low score.
-            if rerank_score is None:
-                rerank_score = float(
-                    "-inf"
-                )
-
-            citation_candidate = {
-                "source": source_name,
-                "page": page_number,
-                "distance": result.get(
-                    "distance"
-                ),
-                "rerank_score": rerank_score,
-                "text": chunk.get(
-                    "text",
-                    ""
-                )
-            }
-
-            # -----------------------------------------------------
-            # Keep only the strongest chunk from each page
-            # -----------------------------------------------------
-
-            if page_number not in page_candidates:
-
-                page_candidates[
-                    page_number
-                ] = citation_candidate
-
-            else:
-
-                existing_score = (
-                    page_candidates[
-                        page_number
-                    ]["rerank_score"]
-                )
-
-                if rerank_score > existing_score:
-
-                    page_candidates[
-                        page_number
-                    ] = citation_candidate
-
-        # ---------------------------------------------------------
-        # Sort pages according to best reranker score
-        # ---------------------------------------------------------
-
-        citations = list(
-            page_candidates.values()
-        )
-
-        citations.sort(
-            key=lambda x: x["rerank_score"],
-            reverse=True
-        )
-
-        # ---------------------------------------------------------
-        # Limit number of citation pages
-        # ---------------------------------------------------------
-
-        citations = citations[
-            :max_citations
-        ]
-
-        # ---------------------------------------------------------
-        # DEBUG CITATIONS
-        # ---------------------------------------------------------
-
-        print("\n" + "=" * 60)
-        print("SELECTED CITATIONS")
-        print("=" * 60)
-
-        for rank, citation in enumerate(
-            citations,
-            start=1
-        ):
-
-            print(
-                f"Rank {rank} | "
-                f"Page {citation['page']} | "
-                f"Rerank Score "
-                f"{citation['rerank_score']}"
+            seen.add(
+                key
             )
+
+            citations.append(
+                {
+                    "source": source,
+
+                    "page": page,
+
+                    "distance": result.get(
+                        "distance"
+                    ),
+
+                    "rerank_score": result.get(
+                        "rerank_score"
+                    )
+                }
+            )
+
+            if len(
+                citations
+            ) >= max_citations:
+
+                break
 
         return citations
 
 
-    # =============================================================
-    # COMPLETE RAG PIPELINE
-    # =============================================================
+    # ==========================================================
+    # MAIN RAG FUNCTION
+    # ==========================================================
 
     def ask(
         self,
         question,
-        page=None,
-        source=None,
-        chat_history=None
+        chat_history=None,
+        source_filter=None
     ):
 
-        # =========================================================
-        # STEP 1: ORIGINAL QUESTION
-        # =========================================================
+        """
+        Execute the complete RAG pipeline.
 
-        print("\n" + "=" * 60)
-        print("ORIGINAL QUESTION")
-        print("=" * 60)
+        Flow:
 
-        print(
-            question
-        )
+        Question
+            ↓
+        Query Rewriting
+            ↓
+        Embedding
+            ↓
+        FAISS Retrieval
+            ↓
+        Optional Source Filtering
+            ↓
+        Cross-Encoder Reranking
+            ↓
+        Context Construction
+            ↓
+        LLM Generation
+            ↓
+        Citation Selection
+        """
 
-        # =========================================================
-        # STEP 2: QUERY REWRITING
-        # =========================================================
+        # ======================================================
+        # VALIDATE QUESTION
+        # ======================================================
+
+        if not question or not question.strip():
+
+            raise ValueError(
+                "Question cannot be empty."
+            )
+
+        # ======================================================
+        # CONVERSATION HISTORY
+        # ======================================================
 
         if chat_history is None:
 
             chat_history = []
+
+        # ======================================================
+        # DEBUG
+        # ======================================================
+
+        print("\n" + "=" * 60)
+        print("RAG PIPELINE")
+        print("=" * 60)
+
+        print(
+            "Original question:",
+            question
+        )
+
+        print(
+            "Source filter:",
+            source_filter
+        )
+
+        # ======================================================
+        # 1. QUERY REWRITING
+        # ======================================================
 
         rewritten_query = (
             self.query_rewriter.rewrite(
@@ -441,130 +754,75 @@ class RAGPipeline:
             )
         )
 
-        print("\n" + "=" * 60)
-        print("REWRITTEN QUERY")
-        print("=" * 60)
-
         print(
+            "\nRewritten query:",
             rewritten_query
         )
 
-        # =========================================================
-        # STEP 3: RETRIEVAL + RERANKING
-        # =========================================================
+        # ======================================================
+        # 2. RETRIEVAL + RERANKING
+        # ======================================================
 
-        results = self.retrieve_reranked(
-            question=rewritten_query,
-            retrieval_k=10,
-            final_k=5,
-            page=page,
-            source=source
-        )
+        results = (
+            self.retrieve_reranked(
+                question=rewritten_query,
 
-        # =========================================================
-        # STEP 4: NO RESULTS
-        # =========================================================
+                retrieval_k=10,
 
-        if not results:
+                final_k=5,
 
-            return {
-                "answer": (
-                    "The information is not available "
-                    "in the provided documents."
-                ),
-                "results": [],
-                "sources": []
-            }
-
-        # =========================================================
-        # STEP 5: BUILD CONTEXT
-        # =========================================================
-
-        context_parts = []
-
-        for result in results:
-
-            chunk = result.get(
-                "chunk",
-                {}
+                source_filter=source_filter
             )
+        )
 
-            text = chunk.get(
-                "text",
-                ""
+        # ======================================================
+        # 3. BUILD CONTEXT
+        # ======================================================
+
+        context = (
+            self.build_context(
+                results
             )
-
-            if text:
-
-                context_parts.append(
-                    text
-                )
-
-        context = "\n\n".join(
-            context_parts
         )
 
-        # =========================================================
-        # PRINT CONTEXT
-        # =========================================================
+        # ======================================================
+        # 4. GENERATE ANSWER
+        # ======================================================
 
-        print("\n" + "=" * 60)
-        print("CONTEXT")
-        print("=" * 60)
+        answer = (
+            self.generator.generate(
+                question=question,
 
-        print(
-            context
+                context=context
+            )
         )
 
-        # =========================================================
-        # STEP 6: GENERATE ANSWER
-        # =========================================================
+        # ======================================================
+        # 5. SELECT CITATIONS
+        # ======================================================
 
-        answer = self.generator.generate(
-            question,
-            context
-        )
-
-        # =========================================================
-        # STEP 7: SELECT PAGE-LEVEL CITATIONS
-        # =========================================================
-
-        selected_citations = (
+        sources = (
             self.select_citations(
                 results,
-                max_citations=1
+                max_citations=3
             )
         )
 
-        # =========================================================
-        # STEP 8: BUILD SOURCE INFORMATION
-        # =========================================================
-
-        sources = []
-
-        for citation in selected_citations:
-
-            sources.append({
-                "source": citation.get(
-                    "source"
-                ),
-                "page": citation.get(
-                    "page"
-                ),
-                "distance": citation.get(
-                    "distance"
-                ),
-                "rerank_score": citation.get(
-                    "rerank_score"
-                )
-            })
-
-        # =========================================================
-        # STEP 9: RETURN FINAL RESULT
-        # =========================================================
+        # ======================================================
+        # 6. RETURN EVERYTHING
+        # ======================================================
 
         return {
+
             "answer": answer,
+
+            "rewritten_query": (
+                rewritten_query
+            ),
+
             "results": results,
-            "sources": sources
+
+            "sources": sources,
+
+            "source_filter": source_filter
         }
